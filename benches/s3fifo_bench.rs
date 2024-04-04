@@ -76,6 +76,6 @@ fn bench_lru_cache(c: &mut Criterion) {
     });
 }
 
-criterion_group!(cache, bench_s3fifo_cache, bench_lru_cache,);
+criterion_group!(cache, bench_s3fifo_cache);
 
 criterion_main!(cache);

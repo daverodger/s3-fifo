@@ -43,5 +43,5 @@ fastrand = "2.0.1"
 
 
 [[bench]]
-name = "store_bench"
+name = "s3fifo_bench"
 harness = false
