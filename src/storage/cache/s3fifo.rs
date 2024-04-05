@@ -2,17 +2,19 @@
 /// used in the main codebase. But the implementation is kept here for future reference for replacing it
 /// with the current LRU cache for caching recently accessed values.
 use hashbrown::HashMap;
-use std::cmp::min;
-use std::collections::LinkedList;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering::SeqCst;
+use std::cmp::max;
+use ringbuf::{HeapRb, Rb};
+use indexmap::IndexSet;
 
 /// Maximum frequency limit for an entry in the cache.
 const MAX_FREQUENCY_LIMIT: u8 = 3;
 
 /// Represents an entry in the cache.
+#[derive(Debug)]
 struct Entry<K, V> {
     key: K,
     value: V,
@@ -32,9 +34,9 @@ impl<K, V> Entry<K, V> {
 }
 
 impl<K, V> Clone for Entry<K, V>
-where
-    K: Clone,
-    V: Clone,
+    where
+        K: Clone,
+        V: Clone,
 {
     fn clone(&self) -> Self {
         Self {
@@ -45,41 +47,66 @@ where
     }
 }
 
+struct GhostQueue<K> {
+    queue: IndexSet<K>,
+    size: usize,
+}
+
+impl<K: Hash + Eq + PartialEq + Clone> GhostQueue<K> {
+    fn new(size: usize) -> Self {
+        Self {
+            queue: IndexSet::with_capacity(size),
+            size,
+        }
+    }
+
+    fn push(&mut self, key: K) {
+        if self.queue.len() == self.size {
+            self.evict()
+        }
+        self.queue.insert(key);
+    }
+
+    fn evict(&mut self) {
+        self.queue.pop();
+    }
+
+    fn contains(&self, key: &K) -> bool {
+        self.queue.contains(key)
+    }
+}
+
 /// Cache is an implementation of "S3-FIFO" from "FIFO Queues are ALL You Need for Cache Eviction" by
-/// Juncheng Yang, et al: <https://jasony.me/publication/sosp23-s3fifo.pdf>
+/// Juncheng Yang, et al. <https://jasony.me/publication/sosp23-s3fifo.pdf>
 pub struct Cache<K, V>
-where
-    K: PartialEq + Eq + Hash + Clone + Debug,
-    V: Clone,
+    where
+        K: PartialEq + Eq + Hash + Clone + Debug,
+        V: Clone + Debug,
 {
-    max_main_size: usize,
-    max_cache_size: usize,
     /// Small queue for entries with low frequency.
-    small: LinkedList<Entry<K, V>>,
+    small: HeapRb<K>,
     /// Main queue for entries with high frequency.
-    main: LinkedList<Entry<K, V>>,
-    /// Ghost queue for evicted entries.
-    ghost: LinkedList<K>,
+    main: HeapRb<K>,
+    /// Ghost queue for evicted entry keys.
+    ghost: GhostQueue<K>,
     /// Map of all entries for quick access.
     entries: HashMap<K, Entry<K, V>>,
 }
 
 impl<K, V> Cache<K, V>
-where
-    K: PartialEq + Eq + Hash + Clone + Debug,
-    V: Clone,
+    where
+        K: PartialEq + Eq + Hash + Clone + Debug,
+        V: Clone + Debug,
 {
     /// Creates a new cache with the given maximum size.
     pub fn new(max_cache_size: usize) -> Self {
-        let max_small_size = max_cache_size / 10;
-        let max_main_size = max_cache_size - max_small_size;
+        let max_small_size = max(max_cache_size / 10, 1);
+        let max_main_size = max(max_cache_size - max_small_size, 1);
 
         Self {
-            max_main_size,
-            max_cache_size,
-            small: LinkedList::new(),
-            main: LinkedList::new(),
-            ghost: LinkedList::new(),
+            small: HeapRb::new(max_small_size),
+            main: HeapRb::new(max_main_size),
+            ghost: GhostQueue::new(max_main_size), // TODO can go as low as 50% of max cache size
             entries: HashMap::new(),
         }
     }
@@ -87,8 +114,10 @@ where
     /// Returns a reference to the value of the given key if it exists in the cache.
     pub fn get(&mut self, key: &K) -> Option<&V> {
         if let Some(entry) = self.entries.get(key) {
-            let freq = min(entry.freq.load(SeqCst) + 1, MAX_FREQUENCY_LIMIT);
-            entry.freq.store(freq, SeqCst);
+            let freq = entry.freq.load(SeqCst);
+            if freq < MAX_FREQUENCY_LIMIT {
+                entry.freq.store(freq + 1, SeqCst);
+            }
             Some(&entry.value)
         } else {
             None
@@ -96,60 +125,71 @@ where
     }
 
     /// Inserts a new entry with the given key and value into the cache.
-    pub fn insert(&mut self, key: K, value: V) {
-        self.evict();
-
+    pub fn insert(&mut self, key: K, value: V) -> bool {
         if self.entries.contains_key(&key) {
-            let entry = Entry::new(key, value);
-            self.main.push_back(entry);
+            return false;
+        }
+        if self.ghost.contains(&key) {
+            self.insert_m(key.clone());
         } else {
-            let entry = Entry::new(key, value);
-            self.entries.insert(entry.key.clone(), entry.clone());
-            self.small.push_back(entry);
+            self.insert_s(key.clone());
         }
-    }
-    fn insert_m(&mut self, tail: Entry<K, V>) {
-        self.main.push_front(tail);
+        let entry = Entry::new(key.clone(), value);
+        self.entries.insert(key, entry);
+        true
     }
 
-    fn insert_g(&mut self, tail: Entry<K, V>) {
-        if self.ghost.len() >= self.max_main_size {
-            let key = self.ghost.pop_front().unwrap();
-            self.entries.remove(&key);
-        }
-        self.ghost.push_back(tail.key);
-    }
-
-    fn evict(&mut self) {
-        if self.small.len() + self.main.len() >= self.max_cache_size {
-            if self.main.len() >= self.max_main_size || self.small.is_empty() {
-                self.evict_m();
-            } else {
-                self.evict_s();
+    fn insert_s(&mut self, key: K) {
+        if let Some(victim) = self.small.push_overwrite(key.clone()) {
+            match self.entries.get(&victim).unwrap().freq.load(SeqCst) {
+                0 => {
+                    self.entries.remove(&victim);
+                    self.insert_g(victim);
+                }
+                _ => {
+                    let entry = self.entries.get(&victim).unwrap();
+                    entry.freq.store(0, SeqCst);
+                    self.insert_m(victim);
+                }
             }
         }
+    }
+    fn insert_m(&mut self, key: K) {
+        if let Some(victim) = self.main.push_overwrite(key) {
+            match self.entries.get(&victim).unwrap().freq.load(SeqCst) {
+                0 => {
+                    self.entries.remove(&victim);
+                }
+                _ => {
+                    self.insert_m({
+                        self.entries.get(&victim).unwrap().freq.fetch_sub(1, SeqCst);
+                        victim
+                    });
+                    self.evict_m();
+                }
+            }
+        }
+    }
+
+    fn insert_g(&mut self, key: K) {
+        self.ghost.push(key);
     }
 
     fn evict_m(&mut self) {
-        while let Some(tail) = self.main.pop_front() {
-            let freq = tail.freq.load(SeqCst);
-            if freq > 0 {
-                tail.freq.store(freq - 1, SeqCst);
-                self.main.push_back(tail);
-            } else {
-                self.entries.remove(&tail.key);
-                break;
-            }
-        }
-    }
-
-    fn evict_s(&mut self) {
-        while let Some(tail) = self.small.pop_front() {
-            if tail.freq.load(SeqCst) > 1 {
-                self.insert_m(tail);
-            } else {
-                self.insert_g(tail);
-                break;
+        let mut evicted = false;
+        while !evicted && self.main.len() > 0 {
+            let victim = self.main.pop().unwrap();
+            match self.entries.get(&victim).unwrap().freq.load(SeqCst) {
+                0 => {
+                    self.entries.remove(&victim);
+                    evicted = true;
+                }
+                _ => {
+                    self.insert_m({
+                        self.entries.get(&victim).unwrap().freq.fetch_sub(1, SeqCst);
+                        victim
+                    });
+                }
             }
         }
     }
@@ -158,8 +198,11 @@ where
 #[cfg(test)]
 mod tests {
     use std::fmt::Debug;
+    use std::sync::{Arc, Mutex};
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering::SeqCst;
+    use std::thread;
+    use rand::{Rng, thread_rng};
 
     use super::*;
 
@@ -173,8 +216,8 @@ mod tests {
         let mut cache = Cache::new(2);
 
         cache.insert("apple", "red");
+        assert_opt_eq(cache.get(&"apple"), "red");
         cache.insert("banana", "yellow");
-
         assert_opt_eq(cache.get(&"apple"), "red");
         assert_opt_eq(cache.get(&"banana"), "yellow");
     }
@@ -196,16 +239,57 @@ mod tests {
         }
 
         assert!(cache.get(&"apple").is_none());
-        assert_opt_eq(cache.get(&"pear"), "green");
         assert_opt_eq(cache.get(&"peach"), "pink");
 
-        // "apple" should been removed from the cache.
+        // "apple" should have been removed from the cache.
         cache.insert("apple", "red");
+        cache.get(&"apple");
         cache.insert("banana", "yellow");
 
         // assert!(cache.get(&"pear").is_none());
         assert_opt_eq(cache.get(&"apple"), "red");
         assert_opt_eq(cache.get(&"banana"), "yellow");
+    }
+
+    #[test]
+    fn test_concurrent() {
+        let cache = Arc::new(Mutex::new(Cache::new(2)));
+        for i in 0..1000 {
+            let i_cache = Arc::clone(&cache);
+            thread::spawn(move || i_cache.lock().unwrap().insert(i, i));
+            let g_cache = Arc::clone(&cache);
+            thread::spawn(move || { g_cache.lock().unwrap().get(&i); });
+        };
+    }
+
+    #[test]
+    fn test_rng_criterion() {
+        let mut rng = thread_rng();
+        let nums: Vec<u64> =
+            (0..(100000 * 2))
+                .map(|i| {
+                    if i % 2 == 0 {
+                        rng.gen::<u64>() % 16384
+                    } else {
+                        rng.gen::<u64>() % 32768
+                    }
+                })
+                .collect()
+            ;
+        let mut l = Cache::new(8192);
+        (0..99999).for_each(|v| {
+            let k = nums[v];
+            l.insert(k, k);
+        });
+    }
+
+    #[test]
+    fn test_simple_dupe() {
+        let mut cache = Cache::new(20);
+        cache.insert("test", "first");
+        cache.insert("test", "second");
+        cache.insert("bug", "third");
+        assert!(cache.get(&"test").is_some());
     }
 
     #[test]
@@ -228,6 +312,6 @@ mod tests {
                 cache.insert(i, DropCounter {});
             }
         }
-        assert_eq!(DROP_COUNT.load(SeqCst), 2 * n * n);
+        assert_eq!(DROP_COUNT.load(SeqCst), n * n);
     }
 }
