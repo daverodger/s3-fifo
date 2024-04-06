@@ -5,7 +5,7 @@ use hashbrown::HashMap;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::sync::atomic::AtomicU8;
-use std::sync::atomic::Ordering::SeqCst;
+use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use std::cmp::max;
 use ringbuf::{HeapRb, Rb};
 use indexmap::IndexSet;
@@ -42,26 +42,26 @@ impl<K, V> Clone for Entry<K, V>
         Self {
             key: self.key.clone(),
             value: self.value.clone(),
-            freq: AtomicU8::new(self.freq.load(SeqCst)),
+            freq: AtomicU8::new(self.freq.load(Relaxed)),
         }
     }
 }
 
 struct GhostQueue<K> {
     queue: IndexSet<K>,
-    size: usize,
+    capacity: usize,
 }
 
 impl<K: Hash + Eq + PartialEq + Clone> GhostQueue<K> {
     fn new(size: usize) -> Self {
         Self {
             queue: IndexSet::with_capacity(size),
-            size,
+            capacity: size,
         }
     }
 
     fn push(&mut self, key: K) {
-        if self.queue.len() == self.size {
+        if self.queue.len() == self.capacity {
             self.evict()
         }
         self.queue.insert(key);
@@ -106,7 +106,7 @@ impl<K, V> Cache<K, V>
         Self {
             small: HeapRb::new(max_small_size),
             main: HeapRb::new(max_main_size),
-            ghost: GhostQueue::new(max_main_size), // TODO can go as low as 50% of max cache size
+            ghost: GhostQueue::new(max_main_size),
             entries: HashMap::new(),
         }
     }
@@ -114,9 +114,9 @@ impl<K, V> Cache<K, V>
     /// Returns a reference to the value of the given key if it exists in the cache.
     pub fn get(&mut self, key: &K) -> Option<&V> {
         if let Some(entry) = self.entries.get(key) {
-            let freq = entry.freq.load(SeqCst);
+            let freq = entry.freq.load(Acquire);
             if freq < MAX_FREQUENCY_LIMIT {
-                entry.freq.store(freq + 1, SeqCst);
+                entry.freq.store(freq + 1, Release);
             }
             Some(&entry.value)
         } else {
@@ -141,14 +141,14 @@ impl<K, V> Cache<K, V>
 
     fn insert_s(&mut self, key: K) {
         if let Some(victim) = self.small.push_overwrite(key.clone()) {
-            match self.entries.get(&victim).unwrap().freq.load(SeqCst) {
+            match self.entries.get(&victim).unwrap().freq.load(Relaxed) {
                 0 => {
                     self.entries.remove(&victim);
                     self.insert_g(victim);
                 }
                 _ => {
                     let entry = self.entries.get(&victim).unwrap();
-                    entry.freq.store(0, SeqCst);
+                    entry.freq.store(0, Relaxed);
                     self.insert_m(victim);
                 }
             }
@@ -156,13 +156,13 @@ impl<K, V> Cache<K, V>
     }
     fn insert_m(&mut self, key: K) {
         if let Some(victim) = self.main.push_overwrite(key) {
-            match self.entries.get(&victim).unwrap().freq.load(SeqCst) {
+            match self.entries.get(&victim).unwrap().freq.load(Relaxed) {
                 0 => {
                     self.entries.remove(&victim);
                 }
                 _ => {
                     self.insert_m({
-                        self.entries.get(&victim).unwrap().freq.fetch_sub(1, SeqCst);
+                        self.entries.get(&victim).unwrap().freq.fetch_sub(1, Relaxed);
                         victim
                     });
                     self.evict_m();
@@ -179,14 +179,14 @@ impl<K, V> Cache<K, V>
         let mut evicted = false;
         while !evicted && self.main.len() > 0 {
             let victim = self.main.pop().unwrap();
-            match self.entries.get(&victim).unwrap().freq.load(SeqCst) {
+            match self.entries.get(&victim).unwrap().freq.load(Relaxed) {
                 0 => {
                     self.entries.remove(&victim);
                     evicted = true;
                 }
                 _ => {
                     self.insert_m({
-                        self.entries.get(&victim).unwrap().freq.fetch_sub(1, SeqCst);
+                        self.entries.get(&victim).unwrap().freq.fetch_sub(1, Relaxed);
                         victim
                     });
                 }
@@ -200,7 +200,7 @@ mod tests {
     use std::fmt::Debug;
     use std::sync::{Arc, Mutex};
     use std::sync::atomic::AtomicUsize;
-    use std::sync::atomic::Ordering::SeqCst;
+    use std::sync::atomic::Ordering::Relaxed;
     use std::thread;
     use rand::{Rng, thread_rng};
 
@@ -301,7 +301,7 @@ mod tests {
 
         impl Drop for DropCounter {
             fn drop(&mut self) {
-                DROP_COUNT.fetch_add(1, SeqCst);
+                DROP_COUNT.fetch_add(1, Relaxed);
             }
         }
 
@@ -312,6 +312,6 @@ mod tests {
                 cache.insert(i, DropCounter {});
             }
         }
-        assert_eq!(DROP_COUNT.load(SeqCst), n * n);
+        assert_eq!(DROP_COUNT.load(Relaxed), n * n);
     }
 }
