@@ -45,5 +45,9 @@ fastrand = "2.0.1"
 
 
 [[bench]]
+name = "s3fifo_dataset_bench"
+harness = false
+
+[[bench]]
 name = "s3fifo_bench"
 harness = false

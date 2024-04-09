@@ -7,6 +7,7 @@ use std::hash::Hash;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use std::cmp::max;
+use std::num::NonZeroUsize;
 use ringbuf::{HeapRb, Rb};
 use indexmap::IndexSet;
 
@@ -99,9 +100,9 @@ impl<K, V> Cache<K, V>
         V: Clone + Debug,
 {
     /// Creates a new cache with the given maximum size.
-    pub fn new(max_cache_size: usize) -> Self {
-        let max_small_size = max(max_cache_size / 10, 1);
-        let max_main_size = max(max_cache_size - max_small_size, 1);
+    pub fn new(max_cache_size: NonZeroUsize) -> Self {
+        let max_small_size = max(max_cache_size.get() / 10, 1);
+        let max_main_size = max(max_cache_size.get() - max_small_size, 1);
 
         Self {
             small: HeapRb::new(max_small_size),
@@ -161,11 +162,10 @@ impl<K, V> Cache<K, V>
                     self.entries.remove(&victim);
                 }
                 _ => {
-                    self.insert_m({
+                    self.insert_m({ // TODO: compare with non-recursive version
                         self.entries.get(&victim).unwrap().freq.fetch_sub(1, Relaxed);
                         victim
                     });
-                    self.evict_m();
                 }
             }
         }
@@ -175,24 +175,6 @@ impl<K, V> Cache<K, V>
         self.ghost.push(key);
     }
 
-    fn evict_m(&mut self) {
-        let mut evicted = false;
-        while !evicted && self.main.len() > 0 {
-            let victim = self.main.pop().unwrap();
-            match self.entries.get(&victim).unwrap().freq.load(Relaxed) {
-                0 => {
-                    self.entries.remove(&victim);
-                    evicted = true;
-                }
-                _ => {
-                    self.insert_m({
-                        self.entries.get(&victim).unwrap().freq.fetch_sub(1, Relaxed);
-                        victim
-                    });
-                }
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -213,7 +195,7 @@ mod tests {
 
     #[test]
     fn test_push_and_read() {
-        let mut cache = Cache::new(2);
+        let mut cache = Cache::new(NonZeroUsize::new(2).unwrap());
 
         cache.insert("apple", "red");
         assert_opt_eq(cache.get(&"apple"), "red");
@@ -224,7 +206,7 @@ mod tests {
 
     #[test]
     fn test_push_removes_oldest() {
-        let mut cache = Cache::new(2);
+        let mut cache = Cache::new(NonZeroUsize::new(2).unwrap());
 
         let fruits = vec![
             ("apple", "red"),
@@ -253,7 +235,7 @@ mod tests {
 
     #[test]
     fn test_concurrent() {
-        let cache = Arc::new(Mutex::new(Cache::new(2)));
+        let cache = Arc::new(Mutex::new(Cache::new(NonZeroUsize::new(2).unwrap())));
         for i in 0..1000 {
             let i_cache = Arc::clone(&cache);
             thread::spawn(move || i_cache.lock().unwrap().insert(i, i));
@@ -276,20 +258,11 @@ mod tests {
                 })
                 .collect()
             ;
-        let mut l = Cache::new(8192);
+        let mut l = Cache::new(NonZeroUsize::new(8192).unwrap());
         (0..99999).for_each(|v| {
             let k = nums[v];
             l.insert(k, k);
         });
-    }
-
-    #[test]
-    fn test_simple_dupe() {
-        let mut cache = Cache::new(20);
-        cache.insert("test", "first");
-        cache.insert("test", "second");
-        cache.insert("bug", "third");
-        assert!(cache.get(&"test").is_some());
     }
 
     #[test]
@@ -307,7 +280,7 @@ mod tests {
 
         let n = 100;
         for _ in 0..n {
-            let mut cache = Cache::new(20);
+            let mut cache = Cache::new(NonZeroUsize::new(20).unwrap());
             for i in 0..n {
                 cache.insert(i, DropCounter {});
             }

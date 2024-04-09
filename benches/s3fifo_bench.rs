@@ -22,7 +22,7 @@ fn bench_s3fifo_cache(c: &mut Criterion) {
                         })
                         .collect(),
                 );
-                let l = Cache::new(8192);
+                let l = Cache::new(NonZeroUsize::new(8192).unwrap());
                 (l, nums)
             },
             |(mut l, nums)| {
