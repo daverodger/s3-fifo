@@ -157,15 +157,17 @@ impl<K, V> Cache<K, V>
     }
     fn insert_m(&mut self, key: K) {
         if let Some(victim) = self.main.push_overwrite(key) {
-            match self.entries.get(&victim).unwrap().freq.load(Relaxed) {
-                0 => {
-                    self.entries.remove(&victim);
-                }
-                _ => {
-                    self.insert_m({ // TODO: compare with non-recursive version
-                        self.entries.get(&victim).unwrap().freq.fetch_sub(1, Relaxed);
-                        victim
-                    });
+            if let Some(entry) = self.entries.get(&victim) {
+                match entry.freq.load(Relaxed) {
+                    0 => {
+                        self.entries.remove(&victim);
+                    }
+                    _ => {
+                        self.insert_m({ // TODO: compare with non-recursive version
+                            self.entries.get(&victim).unwrap().freq.fetch_sub(1, Relaxed);
+                            victim
+                        });
+                    }
                 }
             }
         }
@@ -174,7 +176,6 @@ impl<K, V> Cache<K, V>
     fn insert_g(&mut self, key: K) {
         self.ghost.push(key);
     }
-
 }
 
 #[cfg(test)]
