@@ -5,10 +5,9 @@ use std::num::NonZeroUsize;
 
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use lru::LruCache;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 
 use crate::storage::log::{get_segment_range, Error, IOError, Options, Result, Segment};
 
@@ -20,28 +19,25 @@ const RECORD_HEADER_SIZE: usize = 0;
 /// writing data in a sequential manner.
 pub struct Aol {
     /// The currently active segment where data is being written.
-    pub(crate) active_segment: Segment<RECORD_HEADER_SIZE>,
+    active_segment: Segment<RECORD_HEADER_SIZE>,
 
     /// The ID of the currently active segment.
-    pub(crate) active_segment_id: u64,
+    active_segment_id: u64,
 
     /// The directory where the segment files are located.
-    pub(crate) dir: PathBuf,
+    dir: PathBuf,
 
     /// Configuration options for the AOL instance.
-    pub(crate) opts: Options,
+    opts: Options,
 
     /// A flag indicating whether the AOL instance is closed or not.
     closed: bool,
 
     /// A read-write lock used to synchronize concurrent access to the AOL instance.
-    mutex: Mutex<()>,
+    mutex: RwLock<()>,
 
     /// A cache used to store recently used segments to avoid opening and closing the files.
     segment_cache: RwLock<LruCache<u64, Segment<RECORD_HEADER_SIZE>>>,
-
-    /// A flag indicating whether the AOL instance has encountered an IO error or not.
-    fsync_failed: AtomicBool,
 }
 
 impl Aol {
@@ -77,9 +73,8 @@ impl Aol {
             dir: dir.to_path_buf(),
             opts: opts.clone(),
             closed: false,
-            mutex: Mutex::new(()),
+            mutex: RwLock::new(()),
             segment_cache: RwLock::new(cache),
-            fsync_failed: Default::default(),
         })
     }
 
@@ -110,7 +105,7 @@ impl Aol {
     // Helper function to calculate the active segment ID
     fn calculate_current_write_segment_id(dir: &Path) -> Result<u64> {
         let (_, last) = get_segment_range(dir)?;
-        Ok(last)
+        Ok(if last > 0 { last + 1 } else { 0 })
     }
 
     /// Appends a record to the active segment.
@@ -138,69 +133,58 @@ impl Aol {
             return Err(Error::SegmentClosed);
         }
 
-        self.check_if_fsync_failed()?;
-
         if rec.is_empty() {
             return Err(Error::EmptyBuffer);
         }
 
-        // Check if the record is larger than the maximum file size
-        if rec.len() > self.opts.max_file_size as usize {
-            return Err(Error::RecordTooLarge);
-        }
-
-        let _lock = self.mutex.lock();
+        let _lock = self.mutex.write();
 
         // Get options and initialize variables
         let opts = &self.opts;
+        let mut n = 0usize;
+        let mut offset = 0;
 
-        // Calculate available space in the active segment
-        let available = opts.max_file_size as i64 - self.active_segment.offset() as i64;
+        // TODO: check if there is a potential infinite loop here if the
+        // record is larger than the max file size. Write a test to check this.
+        while n < rec.len() {
+            // Calculate available space in the active segment
+            let mut available = opts.max_file_size as i64 - self.active_segment.offset() as i64;
 
-        // If the entire record can't fit into the remaining space of the current segment,
-        // close the current segment and create a new one
-        if available < rec.len() as i64 {
-            // Rotate to a new segment
+            // If space is not available, create a new segment
+            if available <= 0 {
+                // Rotate to a new segment
 
-            // Sync and close the active segment
-            // Note that closing the segment will
-            // not close the underlying file until
-            // it is dropped.
-            self.active_segment.close()?;
+                // Sync and close the active segment
+                // Note that closing the segment will
+                // not close the underlying file until
+                // it is dropped.
+                self.active_segment.close()?;
 
-            // Increment the active segment id
-            self.active_segment_id += 1;
+                // Increment the active segment id
+                self.active_segment_id += 1;
 
-            // Open a new segment for writing
-            let new_segment = Segment::open(&self.dir, self.active_segment_id, &self.opts)?;
+                // Open a new segment for writing
+                let new_segment = Segment::open(&self.dir, self.active_segment_id, &self.opts)?;
 
-            // Retrieve the previous active segment and replace it with the new one
-            let _ = mem::replace(&mut self.active_segment, new_segment);
+                // Retrieve the previous active segment and replace it with the new one
+                let _ = mem::replace(&mut self.active_segment, new_segment);
+
+                available = opts.max_file_size as i64;
+            }
+
+            // Calculate the amount of data to append
+            let d = std::cmp::min(available as usize, rec.len() - n);
+            let (off, _) = self.active_segment.append(&rec[n..n + d])?;
+
+            // Calculate offset only for the first chunk of data
+            if n == 0 {
+                offset = off + self.calculate_offset();
+            }
+
+            n += d;
         }
 
-        // Write the record to the segment
-        let result = self.active_segment.append(rec);
-        match result {
-            Ok((off, _)) => off,
-            Err(e) => {
-                if let Error::IO(_) = e {
-                    self.set_fsync_failed(true);
-                }
-                return Err(e);
-            }
-        };
-
-        let (off, _) = result.unwrap();
-        // Calculate offset only for the first chunk of data
-        let offset = off + self.calculate_offset();
-
-        Ok((offset, rec.len()))
-    }
-
-    /// Flushes and syncs the active segment.
-    pub fn sync(&mut self) -> Result<()> {
-        self.check_if_fsync_failed()?;
-        self.active_segment.sync()
+        Ok((offset, n))
     }
 
     // Helper function to calculate offset
@@ -227,8 +211,6 @@ impl Aol {
     /// This function may return an error if the provided buffer is empty, or any I/O error occurs
     /// during the reading process.
     pub fn read_at(&self, buf: &mut [u8], off: u64) -> Result<usize> {
-        self.check_if_fsync_failed()?;
-
         if buf.is_empty() {
             return Err(Error::IO(IOError::new(
                 io::ErrorKind::UnexpectedEof,
@@ -243,6 +225,7 @@ impl Aol {
             let read_offset = offset % self.opts.max_file_size;
 
             // Read data from the appropriate segment
+            // r += self.read_segment_data(&mut buf[r..], segment_id, read_offset)?;
             match self.read_segment_data(&mut buf[r..], segment_id, read_offset) {
                 Ok(bytes_read) => {
                     r += bytes_read;
@@ -274,7 +257,7 @@ impl Aol {
         // During read, we acquire a lock to not allow concurrent writes and reads
         // to the active segment file to avoid seek errors.
         if segment_id == self.active_segment.id {
-            let _lock = self.mutex.lock();
+            let _lock = self.mutex.write();
             self.active_segment.read_at(buf, read_offset)
         } else {
             let mut cache = self.segment_cache.write();
@@ -291,42 +274,22 @@ impl Aol {
     }
 
     pub fn close(&mut self) -> Result<()> {
-        let _lock = self.mutex.lock();
+        let _lock = self.mutex.write();
         self.active_segment.close()?;
         Ok(())
     }
 
     // Returns the current offset within the segment.
     pub fn offset(&self) -> Result<u64> {
-        let _lock = self.mutex.lock();
+        let _lock = self.mutex.read();
         Ok((self.active_segment_id * self.opts.max_file_size) + self.active_segment.offset())
     }
 
     pub fn size(&self) -> Result<u64> {
-        let _lock = self.mutex.lock();
+        let _lock = self.mutex.read();
         let cur_segment_size = self.active_segment.file_offset;
         let total_size = (self.active_segment_id * self.opts.max_file_size) + cur_segment_size;
         Ok(total_size)
-    }
-
-    #[inline]
-    fn set_fsync_failed(&self, failed: bool) {
-        self.fsync_failed.store(failed, Ordering::Release);
-    }
-
-    /// Checks if fsync failed and returns error if true. Otherwise, returns Ok.
-    /// This means writes or reads on the log file will not happpen if fsync failed previously.
-    /// The only way to recorver is to close and restart the store to repair the corruped log file.
-    #[inline]
-    fn check_if_fsync_failed(&self) -> Result<()> {
-        if self.fsync_failed.load(Ordering::Acquire) {
-            Err(Error::IO(IOError::new(
-                io::ErrorKind::Other,
-                "fsync failed",
-            )))
-        } else {
-            Ok(())
-        }
     }
 }
 
@@ -510,89 +473,5 @@ mod tests {
 
         // Test closing segment
         assert!(a.close().is_ok());
-    }
-
-    #[test]
-    fn append_large_record() {
-        // Create a temporary directory
-        let temp_dir = create_temp_directory();
-
-        // Create aol options and open a aol file
-        let opts = Options {
-            max_file_size: 1024,
-            ..Default::default()
-        };
-        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
-
-        let large_record = vec![1; 1025];
-        let small_record = vec![1; 1024];
-        let r = a.append(&small_record);
-        assert!(r.is_ok());
-        assert_eq!(1024, a.offset().unwrap());
-
-        let r = a.append(&large_record);
-        assert!(r.is_err());
-        assert_eq!(1024, a.offset().unwrap());
-    }
-
-    #[test]
-    fn fsync_failure() {
-        // Create a temporary directory
-        let temp_dir = create_temp_directory();
-
-        // Create aol options and open a aol file
-        let opts = Options {
-            max_file_size: 1024,
-            ..Default::default()
-        };
-        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
-
-        let small_record = vec![1; 1024];
-        let r = a.append(&small_record);
-        assert!(r.is_ok());
-        assert_eq!(1024, a.offset().unwrap());
-
-        // Simulate fsync failure
-        a.set_fsync_failed(true);
-
-        // Writes should fail aftet fsync failure
-        let r = a.append(&small_record);
-        assert!(r.is_err());
-
-        // Reads should fail after fsync failure
-        let mut read_data = vec![0; 1024];
-        let r = a.read_at(&mut read_data, 0);
-        assert!(r.is_err());
-    }
-
-    #[test]
-    fn append_and_reload_to_check_active_segment_id() {
-        // Create a temporary directory
-        let temp_dir = create_temp_directory();
-
-        // Create aol options and open a aol file
-        let opts = Options {
-            max_file_size: 1024,
-            ..Default::default()
-        };
-        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
-
-        let large_record = vec![1; 1024];
-        let small_record = vec![1; 512];
-        let r = a.append(&large_record);
-        assert!(r.is_ok());
-        assert_eq!(1024, a.offset().unwrap());
-
-        assert_eq!(0, a.active_segment_id);
-
-        a.close().expect("should close");
-
-        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
-        assert_eq!(0, a.active_segment_id);
-
-        let r = a.append(&small_record);
-        assert!(r.is_ok());
-        assert_eq!(1536, a.offset().unwrap());
-        assert_eq!(1, a.active_segment_id);
     }
 }

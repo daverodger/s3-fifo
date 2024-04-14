@@ -61,22 +61,6 @@ impl Mode {
 /// ScanResult is a tuple containing the key, value, timestamp, and commit timestamp of a key-value pair.
 pub type ScanResult = (Vec<u8>, Vec<u8>, u64, u64);
 
-#[derive(Default, Debug, Copy, Clone)]
-pub enum Durability {
-    /// Commits with this durability level will be queued for persitance to disk, and will be
-    /// written to disk in batches of BLOCK_SIZE. This helps reduce the number of disk writes,
-    /// and increases throughput as the data is written to disk in batches. But it does not
-    /// guarantee that the data will be persisted to disk as soon as [Transaction::commit] returns.
-    #[default]
-    Eventual,
-    /// Commits with this durability level are guaranteed to be persistent as soon as
-    /// [Transaction::commit] returns.
-    ///
-    /// Data is fsynced to disk before returning from [Transaction::commit]. This is the slowest
-    /// durability level, but it is the safest.
-    Immediate,
-}
-
 /// `Transaction` is a struct representing a transaction in a database.
 pub struct Transaction {
     /// `read_ts` is the read timestamp of the transaction. This is the time at which the transaction started.
@@ -86,7 +70,7 @@ pub struct Transaction {
     mode: Mode,
 
     /// `snapshot` is the snapshot that the transaction is running in. This is a consistent view of the data at the time the transaction started.
-    pub(crate) snapshot: Option<RwLock<Snapshot>>,
+    pub(crate) snapshot: RwLock<Snapshot>,
 
     /// `buf` is a reusable buffer for encoding transaction records. This is used to reduce memory allocations.
     buf: BytesMut,
@@ -107,9 +91,6 @@ pub struct Transaction {
     /// `committed_values_offsets` is the offsets of values in the transaction post commit to the transaction log. This is used to locate the data in the transaction log.
     committed_values_offsets: HashMap<Bytes, usize>,
 
-    /// `durability` is the durability level of the transaction. This is used to determine how the transaction is committed.
-    durability: Durability,
-
     /// `closed` indicates if the transaction is closed. A closed transaction cannot make any more changes to the data.
     closed: bool,
 }
@@ -117,12 +98,8 @@ pub struct Transaction {
 impl Transaction {
     /// Prepare a new transaction in the given mode.
     pub fn new(core: Arc<Core>, mode: Mode) -> Result<Self> {
+        let snapshot = RwLock::new(Snapshot::take(core.clone(), now())?);
         let read_ts = core.read_ts()?;
-
-        let mut snapshot = None;
-        if !mode.is_write_only() {
-            snapshot = Some(RwLock::new(Snapshot::take(core.clone(), now())?));
-        }
 
         Ok(Self {
             read_ts,
@@ -134,7 +111,6 @@ impl Transaction {
             write_set: Vec::new(),
             read_set: Mutex::new(Vec::new()),
             committed_values_offsets: HashMap::new(),
-            durability: Durability::Eventual,
             closed: false,
         })
     }
@@ -142,11 +118,6 @@ impl Transaction {
     /// Returns the transaction mode.
     pub fn mode(&self) -> Mode {
         self.mode
-    }
-
-    /// Sets the durability level of the transaction.
-    pub fn set_durability(&mut self, durability: Durability) {
-        self.durability = durability;
     }
 
     /// Adds a key-value pair to the store.
@@ -186,7 +157,7 @@ impl Transaction {
         let hashed_key = sha256(key.clone());
 
         // Attempt to get the value for the key from the snapshot.
-        match self.snapshot.as_ref().unwrap().read().get(&key[..].into()) {
+        match self.snapshot.read().get(&key[..].into()) {
             Ok(val_ref) => {
                 // RYOW semantics: Read your own write. If the key is in the write set, return the value.
                 // Check if the key is in the write set by checking in the write_order_map map.
@@ -251,7 +222,7 @@ impl Transaction {
             return Err(Error::MaxValueLengthExceeded);
         }
 
-        if self.write_set.len() as u32 >= self.core.opts.max_entries_per_txn {
+        if self.write_set.len() as u32 >= self.core.opts.max_tx_entries {
             return Err(Error::MaxTransactionEntriesLimitExceeded);
         }
 
@@ -261,11 +232,7 @@ impl Transaction {
             let index_value = ValueRef::encode_mem(&e.value, e.metadata.as_ref());
 
             // Set the key-value pair in the snapshot.
-            self.snapshot
-                .as_ref()
-                .unwrap()
-                .write()
-                .set(&e.key[..].into(), index_value)?;
+            self.snapshot.write().set(&e.key[..].into(), index_value)?;
         }
 
         // Add the entry to the set of pending writes.
@@ -314,7 +281,7 @@ impl Transaction {
         let mut results = Vec::new();
 
         // Create a new reader for the snapshot.
-        let iterator = match self.snapshot.as_ref().unwrap().write().new_reader() {
+        let iterator = match self.snapshot.write().new_reader() {
             Ok(reader) => reader,
             Err(Error::IndexError(TrieError::SnapshotEmpty)) => return Ok(Vec::new()),
             Err(e) => return Err(e),
@@ -400,7 +367,7 @@ impl Transaction {
         // Commit the changes to the store index.
         let done = self
             .core
-            .send_to_write_channel(entries, tx_id, commit_ts, self.durability)
+            .send_to_write_channel(entries, tx_id, commit_ts)
             .await;
 
         if let Err(err) = done {
@@ -448,7 +415,6 @@ impl Transaction {
         self.buf.clear();
         self.write_set.clear();
         self.read_set.lock().clear();
-        self.snapshot.take();
     }
 }
 
@@ -1378,7 +1344,7 @@ mod tests {
         let temp_dir = create_temp_directory();
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
-        opts.max_entries_per_txn = 5;
+        opts.max_tx_entries = 5;
 
         let store = Store::new(opts.clone()).expect("should create store");
 
@@ -1459,7 +1425,7 @@ mod tests {
         let temp_dir = create_temp_directory();
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
-        opts.max_entries_per_txn = ENTRIES as u32;
+        opts.max_tx_entries = ENTRIES as u32;
 
         let store = Store::new(opts.clone()).expect("should create store");
         let mut rng = make_rng();
