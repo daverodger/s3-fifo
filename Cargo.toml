@@ -30,6 +30,8 @@ tokio = { version = "1.36", features = ["rt", "sync"] }
 sha2 = "0.10.8"
 quick_cache = "0.4.0"
 vart = "0.1.1"
+ringbuf = "0.3.3"
+indexmap = "2.2.6"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
