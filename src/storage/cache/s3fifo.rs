@@ -48,6 +48,7 @@ impl<K, V> Clone for Entry<K, V>
     }
 }
 
+/// Used for ghost queue allowing constant access time while retaining insertion order.
 struct GhostQueue<K> {
     queue: IndexSet<K>,
     capacity: usize,
@@ -61,6 +62,7 @@ impl<K: Hash + Eq + PartialEq + Clone> GhostQueue<K> {
         }
     }
 
+    /// Maintain queue size by evicting before insertion if at capacity.
     fn push(&mut self, key: K) {
         if self.queue.len() == self.capacity {
             self.evict()
@@ -90,7 +92,7 @@ pub struct Cache<K, V>
     main: HeapRb<K>,
     /// Ghost queue for evicted entry keys.
     ghost: GhostQueue<K>,
-    /// Map of all entries for quick access.
+    /// Map of all entries for quick access to data.
     entries: HashMap<K, Entry<K, V>>,
 }
 
@@ -140,6 +142,7 @@ impl<K, V> Cache<K, V>
         true
     }
 
+    /// Inserts a new entry into the small queue, evicting objects while full.
     fn insert_s(&mut self, key: K) {
         if let Some(victim) = self.small.push_overwrite(key.clone()) {
             match self.entries.get(&victim).unwrap().freq.load(Relaxed) {
@@ -155,6 +158,9 @@ impl<K, V> Cache<K, V>
             }
         }
     }
+
+    /// Inserts a new entry into the main queue,
+    /// evicting and reinserting objects until a zero referenced entry is found.
     fn insert_m(&mut self, key: K) {
         if let Some(victim) = self.main.push_overwrite(key) {
             if let Some(entry) = self.entries.get(&victim) {
@@ -163,7 +169,7 @@ impl<K, V> Cache<K, V>
                         self.entries.remove(&victim);
                     }
                     _ => {
-                        self.insert_m({ // TODO: compare with non-recursive version
+                        self.insert_m({
                             self.entries.get(&victim).unwrap().freq.fetch_sub(1, Relaxed);
                             victim
                         });
@@ -173,6 +179,7 @@ impl<K, V> Cache<K, V>
         }
     }
 
+    /// Inserts an entry into the ghost queue
     fn insert_g(&mut self, key: K) {
         self.ghost.push(key);
     }

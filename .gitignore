@@ -55,3 +55,7 @@ history.txt
 
 /target
 /benches/results/
+/flamegraph.svg
+/perf.data
+/perf.data.old
+/benches/data/

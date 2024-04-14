@@ -14,6 +14,7 @@ fn main() -> Result<()> {
             for path in paths {
                 let path = path?;
                 let unique_page_count: usize = {
+                    /// Match unique item counts to file name
                     match path.file_name().to_str().unwrap() {
                         "DS1.lis" => 10516352,
                         "OLTP.lis" => 18688, // reduced by factor of 10
